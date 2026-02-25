@@ -2,82 +2,77 @@ import pandas as pd
 import numpy as np
 from ..config import PolicyParams, SKU_UNIT_VALUE, MARGIN_RATE
 
+LAST_N_DAYS = 7
+SHOCK_DAYS = 3
+
 class HeuristicReallocatorPolicy:
     name = "Heuristic Reallocator"
 
     def __init__(self, params: PolicyParams):
         self.p = params
 
+    def _forecast_demand(self, demand_hist, sku, wh, day):
+        recent = demand_hist[(demand_hist["sku"] == sku) & (demand_hist["wh"] == wh) & (demand_hist["day"] <= day)]
+        last_n = recent.tail(LAST_N_DAYS)
+        if last_n.empty:
+            return 0.0
+        last_shock = last_n.tail(SHOCK_DAYS)
+        if last_shock["shock_flag"].sum() >= 1:
+            return float(last_shock["demand"].mean())
+        return float(last_n["demand"].mean())
+
+    def _make_lane_lookup(self, lanes_df):
+        # Create {(from_wh, to_wh): lane_row}
+        return {(row['from_wh'], row['to_wh']): row for _, row in lanes_df.iterrows()}
+
     def plan_transfers(self, day: int, date, on_hand_after_sales: pd.DataFrame,
                        demand_hist: pd.DataFrame, lanes: pd.DataFrame) -> pd.DataFrame:
-        """
-        on_hand_after_sales: columns [wh, sku, on_hand]
-        demand_hist: demand rows up to current day (inclusive), columns [day, wh, sku, demand, shock_flag]
-        lanes: [from_wh,to_wh,lead_days,cost_per_unit,cap_units]
-        """
         orders = []
+        lane_lookup = self._make_lane_lookup(lanes)
 
-        # Forecast: avg last 7 days; if shock active recently, use last 3 days
         for sku in on_hand_after_sales["sku"].unique():
             inv = on_hand_after_sales[on_hand_after_sales["sku"] == sku].copy()
-
-            # compute avg daily demand per wh
-            recent7 = demand_hist[(demand_hist["sku"] == sku) & (demand_hist["day"] <= day)].copy()
-            def avg_dem(wh):
-                sub = recent7[recent7["wh"] == wh].tail(7)
-                if len(sub) == 0:
-                    return 0.0
-                # if last 3 days had shock, adapt
-                last3 = sub.tail(3)
-                if last3["shock_flag"].sum() >= 1:
-                    return float(last3["demand"].mean())
-                return float(sub["demand"].mean())
-
-            inv["avg_dem"] = inv["wh"].apply(avg_dem)
-            inv["target"] = (self.p.horizon_days * inv["avg_dem"]) + (self.p.buffer_days * inv["avg_dem"])
-
+            # Forecast demand for each wh
+            inv["avg_dem"] = inv["wh"].apply(lambda wh: self._forecast_demand(demand_hist, sku, wh, day))
+            inv["target"] = (self.p.horizon_days + self.p.buffer_days) * inv["avg_dem"]
             inv["surplus"] = (inv["on_hand"] - inv["target"]).clip(lower=0)
             inv["shortage"] = (inv["target"] - inv["on_hand"]).clip(lower=0)
 
             donors = inv[inv["surplus"] > 0].copy()
-            recv = inv[inv["shortage"] > 0].copy()
+            receivers = inv[inv["shortage"] > 0].copy()
 
-            if donors.empty or recv.empty:
+            if donors.empty or receivers.empty:
                 continue
+            receivers = receivers.sort_values("shortage", ascending=False)
 
-            recv = recv.sort_values("shortage", ascending=False)
-
-            # allocate greedily
-            for _, r in recv.iterrows():
+            for _, r in receivers.iterrows():
                 need = float(r["shortage"])
                 if need < self.p.min_move:
                     continue
-
-                # choose best donor by effective cost (lane cost + leadtime penalty)
                 best = None
                 best_lane = None
                 for _, d in donors.iterrows():
-                    if d["surplus"] < self.p.min_move:
+                    surplus = float(d["surplus"])
+                    if surplus < self.p.min_move:
                         continue
-                    lane = lanes[(lanes["from_wh"] == d["wh"]) & (lanes["to_wh"] == r["wh"])].iloc[0]
+                    lane_key = (d["wh"], r["wh"])
+                    lane = lane_lookup.get(lane_key)
+                    if lane is None:
+                        continue
                     eff = float(lane["cost_per_unit"]) + self.p.cost_weight_leadtime * float(lane["lead_days"])
                     if best is None or eff < best:
                         best = eff
                         best_lane = (d, lane)
-
                 if best_lane is None:
                     continue
-
                 drow, lane = best_lane
                 qty = min(float(drow["surplus"]), need)
                 qty = int(np.floor(qty))
                 if qty < self.p.min_move:
                     continue
-
                 eta_day = day + int(lane["lead_days"])
                 est_cost = qty * float(lane["cost_per_unit"])
-                est_benefit = qty * (SKU_UNIT_VALUE[sku] * MARGIN_RATE)  # proxy benefit
-
+                est_benefit = qty * (SKU_UNIT_VALUE[sku] * MARGIN_RATE)
                 orders.append({
                     "order_day": day,
                     "order_date": date,
@@ -86,13 +81,12 @@ class HeuristicReallocatorPolicy:
                     "sku": sku,
                     "qty": qty,
                     "eta_day": eta_day,
-                    "eta_date": None,  # filled later by simulator
+                    "eta_date": None,
                     "reason": f"Projected shortage at {r['wh']} ({int(need)}u) and surplus at {drow['wh']} ({int(drow['surplus'])}u); lowest lane cost/leadtime.",
                     "est_benefit": float(est_benefit),
                     "est_cost": float(est_cost),
                 })
-
-                # update local donor/receiver needs
+                # Rather than updating DataFrame, just adjust in local variable
                 donors.loc[donors["wh"] == drow["wh"], "surplus"] -= qty
                 need -= qty
 
