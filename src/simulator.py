@@ -84,7 +84,6 @@ if not orders_df.empty:
 else:
     inv["on_hand_end"] = inv["on_hand_after_sales"]
 
-
     # shipped quantity from this warehouse today
     inv["qty_ship"] = inv["qty"].fillna(0).astype(int)   # <- ship column is "qty"
     inv["on_hand_end"] = (inv["on_hand_after_sales"] - inv["qty_ship"]).clip(lower=0)
