@@ -1,10 +1,12 @@
-import streamlit as st
-import pandas as pd
 import os
 import sys
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT_DIR)
+# Add repo root to Python path so "src" can be imported
+ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT)
+
+import streamlit as st
+import pandas as pd
 
 from src.config import PolicyParams
 from src.data_generator import build_sku_df, build_lanes_df, generate_demand
