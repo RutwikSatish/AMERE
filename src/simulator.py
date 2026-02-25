@@ -58,15 +58,32 @@ def run_simulation(days: int, demand_df: pd.DataFrame, lanes_df: pd.DataFrame, s
 # ship transfers: subtract from donors + add to in_transit
 if not orders_df.empty:
     ship = orders_df.groupby(["from_wh", "sku"], as_index=False)["qty"].sum()
+    ship = ship.rename(columns={"qty": "qty_ship"})
 
-    # Use explicit suffixes to avoid qty_y / qty_x surprises
     inv = inv.merge(
         ship,
         left_on=["wh", "sku"],
         right_on=["from_wh", "sku"],
         how="left",
-        suffixes=("", "_ship")
     )
+
+    inv["qty_ship"] = inv["qty_ship"].fillna(0).astype(int)
+    inv["on_hand_end"] = (inv["on_hand_after_sales"] - inv["qty_ship"]).clip(lower=0)
+
+    inv = inv.drop(columns=["from_wh", "qty_ship"], errors="ignore")
+
+    for _, o in orders_df.iterrows():
+        in_transit.append({
+            "eta_day": int(o["eta_day"]),
+            "to_wh": o["to_wh"],
+            "sku": o["sku"],
+            "qty": int(o["qty"]),
+        })
+
+    transfers.append(orders_df)
+else:
+    inv["on_hand_end"] = inv["on_hand_after_sales"]
+
 
     # shipped quantity from this warehouse today
     inv["qty_ship"] = inv["qty"].fillna(0).astype(int)   # <- ship column is "qty"
