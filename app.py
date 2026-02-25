@@ -1,5 +1,10 @@
 import streamlit as st
 import pandas as pd
+import os
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, ROOT_DIR)
 
 from src.config import PolicyParams
 from src.data_generator import build_sku_df, build_lanes_df, generate_demand
@@ -7,6 +12,7 @@ from src.simulator import run_simulation
 from src.policies.baseline import BaselinePolicy
 from src.policies.heuristic_reallocator import HeuristicReallocatorPolicy
 from src.metrics import compute_metrics
+
 
 st.set_page_config(page_title="AMERE – Inventory Reallocation Engine", layout="wide")
 
