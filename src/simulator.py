@@ -1,6 +1,6 @@
 import pandas as pd
 from .config import WAREHOUSES, SKUS, BASE_DEMAND, WH_MULT
-from .config import PolicyParams
+
 
 def initial_inventory():
     rows = []
@@ -10,116 +10,104 @@ def initial_inventory():
             rows.append({"wh": wh, "sku": sku, "on_hand": int(init)})
     return pd.DataFrame(rows)
 
+
 def run_simulation(days: int, demand_df: pd.DataFrame, lanes_df: pd.DataFrame, sku_df: pd.DataFrame, policy):
     inv = initial_inventory()
-    transfers = []  # all transfer orders
-    inv_states = []
+    transfers_all = []
+    inv_states_all = []
 
-    # in-transit list: each row has eta_day, to_wh, sku, qty
+    # in_transit records: eta_day, to_wh, sku, qty
     in_transit = []
 
-    for day in range(1, days+1):
-        date = demand_df[demand_df["day"] == day]["date"].iloc[0]
+    for day in range(1, days + 1):
+        date = demand_df.loc[demand_df["day"] == day, "date"].iloc[0]
 
-        # receive arrivals
-        arrivals = pd.DataFrame(in_transit)
-        if arrivals.empty:
-            arrivals_today = pd.DataFrame(columns=["to_wh","sku","qty"])
-        else:
+        # ---------- RECEIVE ARRIVALS ----------
+        if len(in_transit) > 0:
+            arrivals = pd.DataFrame(in_transit)
             arrivals_today = arrivals[arrivals["eta_day"] == day].copy()
-            in_transit = arrivals[arrivals["eta_day"] != day].to_dict("records")
+            remaining = arrivals[arrivals["eta_day"] != day].copy()
+            in_transit = remaining.to_dict("records")
+        else:
+            arrivals_today = pd.DataFrame(columns=["eta_day", "to_wh", "sku", "qty"])
 
         if not arrivals_today.empty:
-            add = arrivals_today.groupby(["to_wh","sku"], as_index=False)["qty"].sum()
-            inv = inv.merge(add, left_on=["wh","sku"], right_on=["to_wh","sku"], how="left")
+            add = arrivals_today.groupby(["to_wh", "sku"], as_index=False)["qty"].sum()
+            add = add.rename(columns={"to_wh": "wh"})
+            inv = inv.merge(add, on=["wh", "sku"], how="left")
             inv["qty"] = inv["qty"].fillna(0).astype(int)
             inv["available"] = inv["on_hand"] + inv["qty"]
-            inv = inv.drop(columns=["to_wh","qty"])
+            inv = inv.drop(columns=["qty"])
         else:
             inv["available"] = inv["on_hand"]
 
-        # fulfill demand (lost sales)
-        today_dem = demand_df[demand_df["day"] == day][["wh","sku","demand"]]
-        inv = inv.merge(today_dem, on=["wh","sku"], how="left")
+        # ---------- DEMAND + FULFILLMENT (LOST SALES) ----------
+        today_dem = demand_df.loc[demand_df["day"] == day, ["wh", "sku", "demand"]]
+        inv = inv.merge(today_dem, on=["wh", "sku"], how="left")
         inv["demand"] = inv["demand"].fillna(0).astype(int)
 
-        inv["fulfilled"] = inv[["available","demand"]].min(axis=1)
+        inv["fulfilled"] = inv[["available", "demand"]].min(axis=1)
         inv["lost_sales_units"] = (inv["demand"] - inv["available"]).clip(lower=0)
         inv["on_hand_after_sales"] = inv["available"] - inv["fulfilled"]
 
-        # policy plans transfers
-        on_hand_after = inv[["wh","sku","on_hand_after_sales"]].rename(columns={"on_hand_after_sales":"on_hand"})
+        # ---------- POLICY: PLAN TRANSFERS ----------
+        on_hand_after = inv[["wh", "sku", "on_hand_after_sales"]].rename(columns={"on_hand_after_sales": "on_hand"})
         demand_hist = demand_df[demand_df["day"] <= day].copy()
 
-        orders_df = policy.plan_transfers(day=day, date=date, on_hand_after_sales=on_hand_after, demand_hist=demand_hist, lanes=lanes_df)
+        orders_df = policy.plan_transfers(
+            day=day,
+            date=date,
+            on_hand_after_sales=on_hand_after,
+            demand_hist=demand_hist,
+            lanes=lanes_df,
+        )
+
         if orders_df is None or orders_df.empty:
-            orders_df = pd.DataFrame(columns=["from_wh","to_wh","sku","qty","eta_day"])
+            orders_df = pd.DataFrame(columns=["order_day", "order_date", "from_wh", "to_wh", "sku", "qty", "eta_day"])
 
-# ship transfers: subtract from donors + add to in_transit
-if not orders_df.empty:
-    ship = orders_df.groupby(["from_wh", "sku"], as_index=False)["qty"].sum()
-    ship = ship.rename(columns={"qty": "qty_ship"})
+        # ---------- SHIP TRANSFERS ----------
+        if not orders_df.empty:
+            ship = orders_df.groupby(["from_wh", "sku"], as_index=False)["qty"].sum()
+            ship = ship.rename(columns={"qty": "qty_ship"})
 
-    inv = inv.merge(
-        ship,
-        left_on=["wh", "sku"],
-        right_on=["from_wh", "sku"],
-        how="left",
-    )
+            inv = inv.merge(
+                ship,
+                left_on=["wh", "sku"],
+                right_on=["from_wh", "sku"],
+                how="left",
+            )
 
-    inv["qty_ship"] = inv["qty_ship"].fillna(0).astype(int)
-    inv["on_hand_end"] = (inv["on_hand_after_sales"] - inv["qty_ship"]).clip(lower=0)
+            inv["qty_ship"] = inv["qty_ship"].fillna(0).astype(int)
+            inv["on_hand_end"] = (inv["on_hand_after_sales"] - inv["qty_ship"]).clip(lower=0)
 
-    inv = inv.drop(columns=["from_wh", "qty_ship"], errors="ignore")
+            inv = inv.drop(columns=["from_wh", "qty_ship"], errors="ignore")
 
-    for _, o in orders_df.iterrows():
-        in_transit.append({
-            "eta_day": int(o["eta_day"]),
-            "to_wh": o["to_wh"],
-            "sku": o["sku"],
-            "qty": int(o["qty"]),
-        })
-
-    transfers.append(orders_df)
-else:
-    inv["on_hand_end"] = inv["on_hand_after_sales"]
-
-    # shipped quantity from this warehouse today
-    inv["qty_ship"] = inv["qty"].fillna(0).astype(int)   # <- ship column is "qty"
-    inv["on_hand_end"] = (inv["on_hand_after_sales"] - inv["qty_ship"]).clip(lower=0)
-
-    inv = inv.drop(columns=["from_wh", "qty", "qty_ship"], errors="ignore")
-
-    # add in-transit arrivals
-    for _, o in orders_df.iterrows():
-        in_transit.append({
-            "eta_day": int(o["eta_day"]),
-            "to_wh": o["to_wh"],
-            "sku": o["sku"],
-            "qty": int(o["qty"]),
-        })
-
-    transfers.append(orders_df)
-else:
-    inv["on_hand_end"] = inv["on_hand_after_sales"]
-
-            # add in-transit
+            # add to in_transit
             for _, o in orders_df.iterrows():
-                o = o.to_dict()
-                o["eta_date"] = None
-                in_transit.append({"eta_day": int(o["eta_day"]), "to_wh": o["to_wh"], "sku": o["sku"], "qty": int(o["qty"])})
-            transfers.append(orders_df)
+                in_transit.append(
+                    {
+                        "eta_day": int(o["eta_day"]),
+                        "to_wh": o["to_wh"],
+                        "sku": o["sku"],
+                        "qty": int(o["qty"]),
+                    }
+                )
+
+            transfers_all.append(orders_df)
         else:
             inv["on_hand_end"] = inv["on_hand_after_sales"]
 
-        # record state
-        inv_states.append(inv.assign(day=day, date=date)[[
-            "date","day","wh","sku","on_hand","available","demand","fulfilled","lost_sales_units","on_hand_end"
-        ]])
+        # ---------- RECORD STATE ----------
+        inv_states_all.append(
+            inv.assign(day=day, date=date)[
+                ["date", "day", "wh", "sku", "on_hand", "available", "demand", "fulfilled", "lost_sales_units", "on_hand_end"]
+            ]
+        )
 
-        # advance inventory
-        inv = inv[["wh","sku","on_hand_end"]].rename(columns={"on_hand_end":"on_hand"})
+        # ---------- ADVANCE INVENTORY ----------
+        inv = inv[["wh", "sku", "on_hand_end"]].rename(columns={"on_hand_end": "on_hand"})
 
-    transfers_df = pd.concat(transfers, ignore_index=True) if transfers else pd.DataFrame()
-    inv_states_df = pd.concat(inv_states, ignore_index=True)
+    transfers_df = pd.concat(transfers_all, ignore_index=True) if transfers_all else pd.DataFrame()
+    inv_states_df = pd.concat(inv_states_all, ignore_index=True)
+
     return inv_states_df, transfers_df
